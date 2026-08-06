@@ -131,26 +131,36 @@ warrants — anything with a quote, excluding crypto) into
 
 ## SQLite export (fast indexed reads + atomic updates)
 
-All `.us.txt` trees can be mirrored into a single **SQLite** database for much
-faster loading than thousands of text files: one indexed `bars` table with a
-primary key on `(symbol, market, date)`, so updates are idempotent UPSERTs.
+By default the `.us.txt` trees are mirrored into **one database per market**
+(the recommended layout), so each daily script maintains its own:
+
+```
+data/us.sqlite3        <- pair 1 (fetch_history.py / update_daily.py)
+data/adr.sqlite3       <- pair 2 (fetch_adr_history.py / update_adr_daily.py)
+data/robinhood.sqlite3 <- pair 3 (fetch_robinhood_history.py / update_robinhood_daily.py)
+```
+
+Each DB has an indexed `bars` table with a primary key on `(symbol, market,
+date)`, so updates are idempotent UPSERTs.
 
 ```powershell
-# one-time: convert all three trees into data/market.sqlite3 (git-ignored)
+# one-time: convert all three trees into their per-market DBs (git-ignored)
 .\.venv\Scripts\python.exe rh_data\convert_to_sqlite.py --dry-run    # plan first
 .\.venv\Scripts\python.exe rh_data\convert_to_sqlite.py
 
-# convert a subset / custom path
-.\.venv\Scripts\python.exe rh_data\convert_to_sqlite.py --markets us,adr --db market.sqlite3
+# convert a subset / a single combined DB
+.\.venv\Scripts\python.exe rh_data\convert_to_sqlite.py --markets us,adr
+.\.venv\Scripts\python.exe rh_data\convert_to_sqlite.py --db combined.sqlite3
 ```
 
-Every fetch/update script also accepts `--db <path>` to keep the database in
-sync as it writes files:
+Every fetch/update script writes to its market's DB **by default** (no flag
+needed), and `--db <path>` overrides the target. `--db ""` disables:
 
 ```powershell
-.\.venv\Scripts\python.exe rh_data\update_daily.py --db market.sqlite3
-.\.venv\Scripts\python.exe rh_data\update_adr_daily.py --db market.sqlite3
-.\.venv\Scripts\python.exe rh_data\update_robinhood_daily.py --db market.sqlite3
+.\.venv\Scripts\python.exe rh_data\update_daily.py            # -> data/us.sqlite3
+.\.venv\Scripts\python.exe rh_data\update_adr_daily.py        # -> data/adr.sqlite3
+.\.venv\Scripts\python.exe rh_data\update_robinhood_daily.py  # -> data/robinhood.sqlite3
+.\.venv\Scripts\python.exe rh_data\update_daily.py --db my.sqlite3   # custom path
 ```
 
 Schema:
@@ -170,8 +180,8 @@ Reading in Python:
 
 ```python
 import pandas as pd, sqlite3
-df = pd.read_sql("SELECT * FROM bars WHERE symbol='VOO' AND market='us' ORDER BY date",
-                 sqlite3.connect("data/market.sqlite3"))
+df = pd.read_sql("SELECT * FROM bars WHERE symbol='VOO' ORDER BY date",
+                 sqlite3.connect("data/us.sqlite3"))
 ```
 
 ## Rate limiting

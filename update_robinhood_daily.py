@@ -42,7 +42,7 @@ def main() -> int:
     args = ap.parse_args()
 
     os.makedirs(rc.ROBINHOOD_ROOT, exist_ok=True)
-    conn = rc.open_db(rc.resolve_db_path(args.db)) if args.db else None
+    conn = rc.open_db(rc.resolve_db_path(args.db)) if (args.db and not args.dry_run) else None
     log_fh = open(args.log, "a", encoding="utf-8")
     rc.log(log_fh, f"=== update_robinhood_daily start (rate={args.rate}/min, batch={args.batch}, "
                    f"skip_enumerate={args.skip_enumerate}) ===")
