@@ -1,0 +1,4 @@
+login.toml
+__pycache__/
+data/
+*.log
