@@ -9,8 +9,11 @@ market-data sqlite source so `data_mode = "sqlite"` can read it directly:
 Symbols are stored uppercase zip-style keys (BRK.B -> BRK-B) with market="us".
 
 Usage:
-    python convert_zip_to_sqlite.py [--zip E:\\QuantTrading\\d_us_txt.zip]
-                                    [--db E:\\QuantTrading\\d_us_txt.sqlite3]
+    python convert_zip_to_sqlite.py [--zip d_us_txt.zip]
+                                    [--db d_us_txt.sqlite3]
+
+Defaults resolve relative to this project / its sibling folder (see
+rh_common.ZIP_PATH), so no absolute paths are hardcoded here.
 """
 
 from __future__ import annotations
@@ -42,8 +45,12 @@ CREATE TABLE IF NOT EXISTS bars (
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--zip", default=r"E:\QuantTrading\d_us_txt.zip")
-    ap.add_argument("--db", default=r"E:\QuantTrading\d_us_txt.sqlite3")
+    ap.add_argument("--zip", default=rc.ZIP_PATH)
+    ap.add_argument(
+        "--db",
+        default=os.path.splitext(rc.ZIP_PATH)[0] + ".sqlite3",
+        help="output SQLite db (default: <zip name>.sqlite3 next to the zip)",
+    )
     ap.add_argument("--limit", type=int, default=0, help="only first N files (0 = all)")
     args = ap.parse_args()
 
