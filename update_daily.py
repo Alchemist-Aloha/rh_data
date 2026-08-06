@@ -5,11 +5,11 @@ month of sessions) and appends only bars newer than the file's last date.
 For symbols in d_us_txt.zip that were never fetched: fetches full '5year'
 history. Idempotent - safe to run multiple times, nothing is double-counted.
 
-Rate-limited to <=10 HTTP requests/minute by default (--rate to override).
+Rate-limited to <=100 HTTP requests/minute by default (--rate to override).
 
 Usage:
     python update_daily.py                    # update everything
-    python update_daily.py --rate 20          # faster (Robinhood tolerates more)
+    python update_daily.py --rate 200         # faster (Robinhood tolerates more)
     python update_daily.py --dry-run          # plan only, no network
     python update_daily.py --zip-path <archive.zip>   # custom source archive
     python update_daily.py --zip-out d_us_txt_merged.zip
@@ -32,10 +32,13 @@ def main() -> int:
     ap.add_argument("--zip-path", default=rc.ZIP_PATH,
                     help="source archive for symbol discovery (default: project dir, else sibling)")
     ap.add_argument("--zip-out", default="", help="also write a merged zip (overlays the source archive)")
+    ap.add_argument("--db", default=rc.US_DB,
+                    help="SQLite db to also write (default: data/us.sqlite3; --db '' disables)")
     ap.add_argument("--log", default=os.path.join(rc.HERE, "update_daily.log"))
     args = ap.parse_args()
 
     os.makedirs(rc.DATA_ROOT, exist_ok=True)
+    conn = rc.open_db(rc.resolve_db_path(args.db)) if args.db else None
     log_fh = open(args.log, "a", encoding="utf-8")
     rc.log(log_fh, f"=== update_daily start (rate={args.rate}/min, batch={args.batch}) ===")
 
@@ -106,6 +109,8 @@ def main() -> int:
                     rc.log(log_fh, f"    FAIL {sym}: no data")
                     continue
                 rc.write_rows(path, rows)
+                if conn is not None:
+                    rc.upsert_rows(conn, rows, "us")
                 total_added += len(rows)
             rc.log(log_fh, f"  batch {i // args.batch + 1}: {len(chunk)} new symbols done")
 
@@ -125,6 +130,8 @@ def main() -> int:
                         rc.log(log_fh, f"    FAIL {sym}: no data returned")
                     continue
                 added = rc.append_new_rows(path, rows)
+                if conn is not None:
+                    rc.upsert_rows(conn, rows, "us")
                 b_added += added
                 if added:
                     rc.log(log_fh, f"    +{added:3d} bars {sym} (was last {last})")
@@ -140,6 +147,8 @@ def main() -> int:
         n = rc.merge_into_zip(args.zip_path, args.zip_out)
         rc.log(log_fh, f"zip written: {args.zip_out} ({n} rh_data members overlaid)")
 
+    if conn is not None:
+        conn.close()
     log_fh.close()
     return 0 if failed == 0 else 2
 

@@ -11,7 +11,7 @@ Notes:
     bars at 5 years, so SPAN_FULL = '5year' is the maximum daily history
     Robinhood can serve.
   * Requests are rate-limited to <= ``rate`` per 60-second rolling window
-    (default 10, per the user's constraint).
+    (default 100).
   * Batches of symbols share ONE HTTP request, so the full ~13k symbol
     universe costs only ~265 requests, not 13k.
 """
@@ -20,10 +20,11 @@ from __future__ import annotations
 
 import datetime as dt
 import os
+import sqlite3
 import sys
 import time
 import zipfile
-from typing import Iterable
+from typing import Any, Callable, Iterable
 
 # ---------------------------------------------------------------------------
 # Paths / constants
@@ -49,7 +50,7 @@ DATA_ROOT = os.path.join(HERE, "data")                   # generated dataset
 
 HEADER = "<TICKER>,<PER>,<DATE>,<TIME>,<OPEN>,<HIGH>,<LOW>,<CLOSE>,<VOL>,<OPENINT>"
 
-DEFAULT_RATE = 10      # max HTTP requests per minute (user constraint)
+DEFAULT_RATE = 100      # max HTTP requests per minute (user constraint)
 DEFAULT_BATCH = 50     # symbols per historicals HTTP request
 INTERVAL = "day"
 SPAN_FULL = "5year"    # max daily history the API serves
@@ -96,15 +97,16 @@ def do_login() -> None:
     """Log in once using the project-dir ``alt_login`` (SMS-challenge aware)."""
     add_login_to_path()
     username, password = load_credentials()
+    alt_login_func: Callable[..., Any] | None = None
     try:
-        from alt_login import login as alt_login
+        from alt_login import login as alt_login_func
     except Exception:
-        alt_login = None
-    if alt_login is not None:
+        pass  # alt_login.py missing -> fall back to robin_stocks authentication below
+    if alt_login_func is not None:
         if username and password:
-            alt_login(username, password)
+            alt_login_func(username, password)
         else:
-            alt_login()  # uses ~/.tokens pickle cache or prompts interactively
+            alt_login_func()  # uses ~/.tokens pickle cache or prompts interactively
         return
     import robin_stocks.robinhood.authentication as auth
     if username and password:
@@ -212,6 +214,155 @@ def out_path(symbol: str, group: str, root: str = DATA_ROOT) -> str:
 
 
 # ---------------------------------------------------------------------------
+# ADR (American Depositary Receipts) support
+# ---------------------------------------------------------------------------
+
+ADR_ROOT = os.path.join(DATA_ROOT, "daily", "adr")       # data/daily/adr
+
+
+def adr_path(symbol: str, root: str = ADR_ROOT) -> str:
+    """Path of an ADR's file inside the adr group (mirrors the zip naming)."""
+    return os.path.join(root, f"{zip_style(symbol).lower()}.us.txt")
+
+
+def discover_adr_from_tree(root: str = ADR_ROOT) -> list[str]:
+    """Return ADR symbols already fetched into the adr tree."""
+    if not os.path.isdir(root):
+        return []
+    return sorted(
+        fn[: -len(".us.txt")].upper() for fn in os.listdir(root) if fn.endswith(".us.txt")
+    )
+
+
+def read_adr_manifest(root: str = ADR_ROOT) -> list[str]:
+    """Read the saved ADR symbol manifest (_adr_symbols.txt), if present."""
+    path = os.path.join(root, "_adr_symbols.txt")
+    if not os.path.exists(path):
+        return []
+    return sorted({line.strip().upper() for line in open(path, encoding="utf-8") if line.strip()})
+
+
+def write_adr_manifest(symbols: Iterable[str], root: str = ADR_ROOT) -> None:
+    """Save the ADR symbol list to _adr_symbols.txt (reference only)."""
+    os.makedirs(root, exist_ok=True)
+    with open(os.path.join(root, "_adr_symbols.txt"), "w", encoding="utf-8") as f:
+        f.write("\n".join(sorted(set(symbols))) + "\n")
+
+
+def fetch_all_adr_symbols(limiter: RateLimiter, max_pages: int = 0) -> list[str]:
+    """Enumerate current ADR instruments from Robinhood (rate-limited).
+
+    Paginates https://api.robinhood.com/instruments/?type=adr&active=true
+    through the rate limiter so every page counts against the request budget.
+    Filters client-side on type == 'adr' as a safety net in case the server
+    ignores the filter. Logs page progress to stderr.
+    """
+    import robin_stocks.robinhood.helper as helper
+
+    url = "https://api.robinhood.com/instruments/"
+    params = {"type": "adr", "active": "true"}
+    symbols: list[str] = []
+    pages = 0
+    while url:
+        limiter.wait()
+        try:
+            res = helper.SESSION.get(url, params=params if pages == 0 else None, timeout=30)
+            res.raise_for_status()
+            data = res.json()
+        except Exception as exc:
+            print(f"    !! instruments fetch failed (page {pages + 1}): {exc}", file=sys.stderr)
+            break
+        pages += 1
+        page_adrs = [
+            item["symbol"]
+            for item in data.get("results", [])
+            if item.get("type") == "adr" and item.get("symbol")
+        ]
+        symbols.extend(page_adrs)
+        print(f"    instruments page {pages}: {len(page_adrs)} adrs "
+              f"(total {len(symbols)})", file=sys.stderr)
+        url = data.get("next")
+        if max_pages and pages >= max_pages:
+            print(f"    (stopping after {max_pages} pages)", file=sys.stderr)
+            break
+    return sorted(set(symbols))
+
+
+# ---------------------------------------------------------------------------
+# Full-Robinhood-universe support (all equity instruments, not just ADRs)
+# ---------------------------------------------------------------------------
+
+ROBINHOOD_ROOT = os.path.join(DATA_ROOT, "daily", "robinhood")   # data/daily/robinhood
+
+
+def robinhood_path(symbol: str, root: str = ROBINHOOD_ROOT) -> str:
+    """Path of a symbol's file inside the robinhood group (mirrors the zip naming)."""
+    return os.path.join(root, f"{zip_style(symbol).lower()}.us.txt")
+
+
+def discover_robinhood_from_tree(root: str = ROBINHOOD_ROOT) -> list[str]:
+    """Return symbols already fetched into the robinhood tree (zip-style keys)."""
+    if not os.path.isdir(root):
+        return []
+    return sorted(
+        fn[: -len(".us.txt")].upper() for fn in os.listdir(root) if fn.endswith(".us.txt")
+    )
+
+
+def read_robinhood_manifest(root: str = ROBINHOOD_ROOT) -> list[str]:
+    """Read the saved robinhood symbol manifest (_robinhood_symbols.txt)."""
+    path = os.path.join(root, "_robinhood_symbols.txt")
+    if not os.path.exists(path):
+        return []
+    return sorted({line.strip().upper() for line in open(path, encoding="utf-8") if line.strip()})
+
+
+def write_robinhood_manifest(symbols: Iterable[str], root: str = ROBINHOOD_ROOT) -> None:
+    """Save the robinhood symbol list to _robinhood_symbols.txt (reference only)."""
+    os.makedirs(root, exist_ok=True)
+    with open(os.path.join(root, "_robinhood_symbols.txt"), "w", encoding="utf-8") as f:
+        f.write("\n".join(sorted(set(symbols))) + "\n")
+
+
+def fetch_all_robinhood_symbols(limiter: RateLimiter, max_pages: int = 0) -> list[str]:
+    """Enumerate every equity instrument from Robinhood (rate-limited).
+
+    Paginates https://api.robinhood.com/instruments/?active=true through the
+    rate limiter so every page counts against the request budget. Returns
+    zip-style dataset keys (dots -> hyphens, e.g. BRK.B -> BRK-B). Crypto is
+    not part of this endpoint. Logs page progress to stderr.
+    """
+    import robin_stocks.robinhood.helper as helper
+
+    url = "https://api.robinhood.com/instruments/"
+    params = {"active": "true"}
+    keys: list[str] = []
+    pages = 0
+    while url:
+        limiter.wait()
+        try:
+            res = helper.SESSION.get(url, params=params if pages == 0 else None, timeout=30)
+            res.raise_for_status()
+            data = res.json()
+        except Exception as exc:
+            print(f"    !! instruments fetch failed (page {pages + 1}): {exc}", file=sys.stderr)
+            break
+        pages += 1
+        page_results = data.get("results", [])
+        for item in page_results:
+            sym = item.get("symbol")
+            if sym:
+                keys.append(zip_style(sym))
+        print(f"    instruments page {pages}: {len(page_results)} instruments "
+              f"(total {len(keys)})", file=sys.stderr)
+        url = data.get("next")
+        if max_pages and pages >= max_pages:
+            print(f"    (stopping after {max_pages} pages)", file=sys.stderr)
+            break
+    return sorted(set(keys))
+
+
+# ---------------------------------------------------------------------------
 # Row formatting / file IO (d_us_txt format)
 # ---------------------------------------------------------------------------
 
@@ -281,20 +432,30 @@ def write_rows(path: str, rows: list[str]) -> None:
 
 
 def append_new_rows(path: str, rows: list[str]) -> int:
-    """Append rows newer than the file's last DATE (idempotent). Returns count added.
+    """Append rows newer than the file's last DATE and refresh the last row.
 
-    Rewrites the file preserving existing rows; duplicates and stale rows are dropped.
+    Idempotent. Returns the number of NEW bars added.
+
+    - Rows with a date strictly newer than the file's last date are appended.
+    - The row for the file's LAST date is refreshed when the fetch contains a
+      bar for that same date (a completed session's bar is more authoritative
+      than anything already on disk, e.g. a mid-day partial-volume snapshot).
+    - Duplicate and stale rows are dropped.
     """
     existing = read_rows(path)
     last = row_date(existing[-1]) if existing else 0
     by_date = {row_date(r): r for r in existing}
     added = 0
+    refreshed = False
     for r in rows:
         d = row_date(r)
         if d > last and d not in by_date:
             by_date[d] = r
             added += 1
-    if added:
+        elif d == last and d and by_date.get(d) != r:
+            by_date[d] = r  # replace the most recent bar with the fresh one
+            refreshed = True
+    if added or refreshed:
         write_rows(path, [by_date[d] for d in sorted(by_date)])
     return added
 
@@ -339,6 +500,10 @@ def fetch_symbol_batch(
 
     Returns {dataset_symbol: [bars]} using the first candidate that returned data.
     Every request is rate-limited; candidate lists are chunked by ``batch``.
+
+    If a whole chunk comes back empty (e.g. the historicals endpoint returns
+    HTTP 400 because one ticker in the batch is problematic), the chunk is
+    retried symbol-by-symbol so a single bad ticker cannot sink the rest.
     """
     cand_map = {s: robinhood_candidates(s) for s in symbols}
     all_cands: list[str] = []
@@ -350,7 +515,15 @@ def fetch_symbol_batch(
                 all_cands.append(c)
     got: dict[str, list[dict]] = {}
     for i in range(0, len(all_cands), batch):
-        got.update(fetch_batch(stocks, all_cands[i : i + batch], span, limiter))
+        chunk = all_cands[i : i + batch]
+        res = fetch_batch(stocks, chunk, span, limiter)
+        if not res:
+            # whole chunk failed (e.g. HTTP 400) -> isolate the bad tickers
+            print(f"    ! batch of {len(chunk)} returned nothing - retrying individually",
+                  file=sys.stderr)
+            for c in chunk:
+                res.update(fetch_batch(stocks, [c], span, limiter))
+        got.update(res)
     out: dict[str, list[dict]] = {}
     for s in symbols:
         for c in cand_map[s]:
@@ -394,6 +567,96 @@ def merge_into_zip(src_zip: str, out_zip: str, root: str = DATA_ROOT) -> int:
         for member, full in overlay.items():
             zout.write(full, member)
     return len(overlay)
+
+
+# ---------------------------------------------------------------------------
+# SQLite export
+# ---------------------------------------------------------------------------
+
+# One database per market (the default layout); each pair's scripts default
+# to its own DB. Passing --db <path> anywhere writes to a single combined DB.
+US_DB = os.path.join(DATA_ROOT, "us.sqlite3")
+ADR_DB = os.path.join(DATA_ROOT, "adr.sqlite3")
+ROBINHOOD_DB = os.path.join(DATA_ROOT, "robinhood.sqlite3")
+MARKET_DB = {"us": US_DB, "adr": ADR_DB, "robinhood": ROBINHOOD_DB}
+
+_DB_SCHEMA = """
+CREATE TABLE IF NOT EXISTS bars (
+    symbol  TEXT    NOT NULL,   -- zip-style symbol, e.g. 'AAPL', 'BRK-B'
+    market  TEXT    NOT NULL,   -- 'us' | 'adr' | 'robinhood'
+    date    INTEGER NOT NULL,   -- YYYYMMDD
+    open    REAL    NOT NULL,
+    high    REAL    NOT NULL,
+    low     REAL    NOT NULL,
+    close   REAL    NOT NULL,
+    volume  INTEGER NOT NULL,
+    openint INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (symbol, market, date)
+) WITHOUT ROWID
+"""
+
+
+def resolve_db_path(db_arg: str) -> str:
+    """Resolve a --db argument to an absolute path (relative -> project dir)."""
+    return db_arg if os.path.isabs(db_arg) else os.path.join(HERE, db_arg)
+
+
+def open_db(db_path: str = US_DB) -> sqlite3.Connection:
+    """Open (creating if needed) the bars database and ensure the schema."""
+    os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
+    conn = sqlite3.connect(db_path)
+    conn.execute(_DB_SCHEMA)
+    conn.commit()
+    return conn
+
+
+def rows_to_db_rows(rows: Iterable[str], market: str) -> list[tuple]:
+    """Convert d_us_txt rows to (symbol, market, date, o, h, l, c, vol, openint)."""
+    out: list[tuple] = []
+    for row in rows:
+        p = row.split(",")
+        if len(p) < 9:
+            continue
+        symbol = p[0]
+        for suffix in (".US", ".us"):
+            if symbol.endswith(suffix):
+                symbol = symbol[: -len(suffix)]
+                break
+        try:
+            out.append((
+                symbol,
+                market,
+                int(p[2]),
+                float(p[4]), float(p[5]), float(p[6]), float(p[7]),
+                int(float(p[8])),
+                int(float(p[9])) if len(p) > 9 and p[9] else 0,
+            ))
+        except ValueError:
+            continue
+    return out
+
+
+def upsert_rows(conn: sqlite3.Connection, rows: Iterable[str], market: str, commit: bool = True) -> int:
+    """Upsert d_us_txt rows into the bars table (idempotent). Returns row count."""
+    data = rows_to_db_rows(rows, market)
+    if not data:
+        return 0
+    conn.executemany(
+        """INSERT INTO bars (symbol, market, date, open, high, low, close, volume, openint)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT (symbol, market, date) DO UPDATE SET
+             open = excluded.open, high = excluded.high, low = excluded.low,
+             close = excluded.close, volume = excluded.volume, openint = excluded.openint""",
+        data,
+    )
+    if commit:
+        conn.commit()
+    return len(data)
+
+
+def write_file_to_db(conn: sqlite3.Connection, path: str, market: str, commit: bool = True) -> int:
+    """Upsert one .us.txt file's rows into the bars table. Returns row count."""
+    return upsert_rows(conn, read_rows(path), market, commit=commit)
 
 
 # ---------------------------------------------------------------------------

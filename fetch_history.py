@@ -4,7 +4,7 @@ Writes files that mirror d_us_txt.zip's structure and row format:
 
     rh_data/data/daily/us/<group>/<symbol>.us.txt
 
-Rate-limited to <=10 HTTP requests/minute by default (--rate to override).
+Rate-limited to <=100 HTTP requests/minute by default (--rate to override).
 Symbols that already have a non-empty file are skipped (--refresh to refetch),
 so the script is resumable after an interrupted run.
 
@@ -40,10 +40,13 @@ def main() -> int:
     ap.add_argument("--zip-path", default=rc.ZIP_PATH,
                     help="source archive for symbol discovery (default: project dir, else sibling)")
     ap.add_argument("--zip-out", default="", help="also write a merged zip (overlays the source archive)")
+    ap.add_argument("--db", default=rc.US_DB,
+                    help="SQLite db to also write (default: data/us.sqlite3; --db '' disables)")
     ap.add_argument("--log", default=os.path.join(rc.HERE, "fetch_history.log"))
     args = ap.parse_args()
 
     os.makedirs(rc.DATA_ROOT, exist_ok=True)
+    conn = rc.open_db(rc.resolve_db_path(args.db)) if args.db else None
     log_fh = open(args.log, "a", encoding="utf-8")
     rc.log(log_fh, f"=== fetch_history start (rate={args.rate}/min, batch={args.batch}) ===")
 
@@ -116,6 +119,8 @@ def main() -> int:
                 rc.log(log_fh, f"    FAIL {sym}: {reason}")
                 continue
             rc.write_rows(path, rows)
+            if conn is not None:
+                rc.upsert_rows(conn, rows, "us")
             b_ok += 1
         ok += b_ok
         failed += b_fail
@@ -129,6 +134,8 @@ def main() -> int:
         n = rc.merge_into_zip(args.zip_path, args.zip_out)
         rc.log(log_fh, f"zip written: {args.zip_out} ({n} rh_data members overlaid)")
 
+    if conn is not None:
+        conn.close()
     log_fh.close()
     return 0 if failed == 0 else 2
 
