@@ -1,14 +1,10 @@
-"""Fetch the full daily history for every Robinhood ADR into data/daily/adr/.
+"""Fetch the full daily history for every Robinhood ADR into SQLite.
 
-Writes d_us_txt-style files (same header/row format as d_us_txt.zip):
-
-    rh_data/data/daily/adr/<symbol>.us.txt     e.g. baba.us.txt -> BABA.US,D,...
-    rh_data/data/daily/adr/_adr_symbols.txt    manifest of discovered ADR symbols
-
+Writes rows directly into data/adr.sqlite3 (bars table, upsert). No txt files.
 The ADR symbol list is enumerated from the Robinhood instruments API
-(?type=adr&active=true), paginated through the rate limiter (so every page
-counts against the request budget). Symbols already fetched are skipped
-(--refresh to overwrite), so reruns resume after an interruption.
+(?type=adr&active=true), paginated through the rate limiter, and saved to the
+symbols table in the adr sqlite. Symbols already in the DB are skipped
+(--refresh to refetch), so reruns resume after an interruption.
 
 Rate-limited to <=100 HTTP requests/minute by default (--rate to override).
 
@@ -16,7 +12,7 @@ Usage:
     python fetch_adr_history.py                 # all current Robinhood ADRs
     python fetch_adr_history.py --limit 10      # first 10 ADRs (test run)
     python fetch_adr_history.py --symbols BABA,TCEHY
-    python fetch_adr_history.py --refresh       # overwrite existing files
+    python fetch_adr_history.py --refresh       # refetch existing symbols
     python fetch_adr_history.py --dry-run       # plan only (no history fetch)
 """
 
@@ -35,14 +31,13 @@ def main() -> int:
     ap.add_argument("--limit", type=int, default=0, help="stop after N symbols (0 = no limit)")
     ap.add_argument("--rate", type=int, default=rc.DEFAULT_RATE, help="max HTTP requests per minute")
     ap.add_argument("--batch", type=int, default=rc.DEFAULT_BATCH, help="symbols per HTTP request")
-    ap.add_argument("--refresh", action="store_true", help="refetch even if the file already exists")
+    ap.add_argument("--refresh", action="store_true", help="refetch even if already in the DB")
     ap.add_argument("--dry-run", action="store_true", help="print the plan without fetching history")
     ap.add_argument("--db", default=rc.ADR_DB,
-                    help="SQLite db to also write (default: data/adr.sqlite3; --db '' disables)")
+                    help="SQLite db to write (default: data/adr.sqlite3; --db '' disables)")
     ap.add_argument("--log", default=os.path.join(rc.HERE, "fetch_adr_history.log"))
     args = ap.parse_args()
 
-    os.makedirs(rc.ADR_ROOT, exist_ok=True)
     conn = rc.open_db(rc.resolve_db_path(args.db)) if (args.db and not args.dry_run) else None
     log_fh = open(args.log, "a", encoding="utf-8")
     rc.log(log_fh, f"=== fetch_adr_history start (rate={args.rate}/min, batch={args.batch}) ===")
@@ -71,27 +66,22 @@ def main() -> int:
         rc.log(log_fh, "no ADR symbols found (run once without --dry-run to build the manifest)")
         return 1
 
-    # --- 2. Worklist: skip files that already exist ------------------------
-    todo: list[tuple[str, str]] = []
-    skipped = 0
-    for sym in symbols:
-        path = rc.adr_path(sym)
-        if not args.refresh and os.path.exists(path) and rc.read_rows(path):
-            skipped += 1
-            continue
-        todo.append((sym, path))
+    # --- 2. Worklist: skip symbols already in the DB ------------------------
+    db_syms = rc.db_symbols(conn, "adr") if conn is not None else set()
+    todo = [s for s in symbols if args.refresh or s not in db_syms]
+    skipped = len(symbols) - len(todo)
     if args.limit:
         todo = todo[: args.limit]
     rc.log(log_fh, f"universe={len(symbols)} already_fetched={skipped} to_fetch={len(todo)}")
 
     if not todo:
-        rc.log(log_fh, "nothing to fetch (use --refresh to overwrite existing files)")
+        rc.log(log_fh, "nothing to fetch (use --refresh to overwrite existing rows)")
         return 0
 
     if args.dry_run:
         rc.log(log_fh, "DRY RUN - would fetch:")
-        for sym, path in todo[:20]:
-            rc.log(log_fh, f"  {sym:12s} -> {os.path.relpath(path, rc.HERE)}")
+        for sym in todo[:20]:
+            rc.log(log_fh, f"  {sym:12s} -> data/adr.sqlite3")
         if len(todo) > 20:
             rc.log(log_fh, f"  ... and {len(todo) - 20} more")
         n_req = (len(todo) + args.batch - 1) // args.batch
@@ -110,16 +100,15 @@ def main() -> int:
     n_batches = (len(todo) + args.batch - 1) // args.batch
     for i in range(0, len(todo), args.batch):
         chunk = todo[i : i + args.batch]
-        batch = rc.fetch_symbol_batch(stocks, [c[0] for c in chunk], rc.SPAN_FULL, limiter, args.batch)
+        batch = rc.fetch_symbol_batch(stocks, chunk, rc.SPAN_FULL, limiter, args.batch)
         b_ok = b_fail = 0
-        for sym, path in chunk:
+        for sym in chunk:
             rows = rc.bars_to_rows(sym, batch.get(sym) or [])
             if not rows:
                 b_fail += 1
                 reason = "no data returned" if sym not in batch else "0 usable rows"
                 rc.log(log_fh, f"    FAIL {sym}: {reason}")
                 continue
-            rc.write_rows(path, rows)
             if conn is not None:
                 rc.upsert_rows(conn, rows, "adr")
             b_ok += 1

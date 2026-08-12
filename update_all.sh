@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# Nightly rh_data update:
-#   1. update_daily.py            -> data/daily/us/ tree + data/us.sqlite3, and
-#      overlays the fresh US tree onto d_us_txt.zip -> d_us_txt_merged.zip
-#   2. update_adr_daily.py        -> data/daily/adr/ tree + data/adr.sqlite3
-#   3. update_robinhood_daily.py  -> data/daily/robinhood/ + data/robinhood.sqlite3
-#   4. convert_zip_to_sqlite.py   -> rebuild d_us_txt.sqlite3 from the merged zip
+# Nightly rh_data update (SQLite only - no txt files):
+#   1. update_daily.py            -> data/us.sqlite3 (full history for new
+#      zip symbols, incremental span='month' for stored symbols)
+#   2. update_adr_daily.py        -> data/adr.sqlite3
+#   3. update_robinhood_daily.py  -> data/robinhood.sqlite3
+#   4. convert_zip_to_sqlite.py   -> rebuild d_us_txt.sqlite3 from the stooq
+#      zip, then overlay the fresh data/us.sqlite3 rows on top
 # Idempotent (UPSERT PK symbol,market,date) - safe to rerun.
 #
 # Exit codes: 0 ok, 1 hard failure. Symbol-level FAILs (exit 2 from the
@@ -13,7 +14,6 @@ set -u
 cd "$(dirname "$0")" || exit 1
 HERE="$(pwd)"
 ROOT="$(dirname "$HERE")"            # QuantTrading
-MERGED="$ROOT/d_us_txt_merged.zip"  # source zip + fresh pair-1 overlay
 PY=(uv run --quiet python)
 
 echo "=== rh_data update start $(date '+%F %T %Z') ==="
@@ -30,14 +30,26 @@ step() {  # <name> <cmd...>
   rm -f "$tmp"
 }
 
-step us        "${PY[@]}" update_daily.py --zip-out "$MERGED"
+step us        "${PY[@]}" update_daily.py
 step adr       "${PY[@]}" update_adr_daily.py
 step robinhood "${PY[@]}" update_robinhood_daily.py
-if [ -f "$MERGED" ]; then
-  step rebuild "${PY[@]}" convert_zip_to_sqlite.py --zip "$MERGED" --db "$ROOT/d_us_txt.sqlite3"
+step rebuild   "${PY[@]}" convert_zip_to_sqlite.py --zip "$ROOT/d_us_txt.zip" \
+                 --db "$ROOT/d_us_txt.sqlite3" --overlay "$HERE/data/us.sqlite3"
+step overlay-rh "${PY[@]}" convert_zip_to_sqlite.py --zip "$ROOT/d_us_txt.zip" \
+                 --db "$ROOT/d_us_txt.sqlite3" --limit 1 \
+                 --overlay "$HERE/data/robinhood.sqlite3" --overlay-market robinhood
+
+# Stooq Current Data snapshot (today's rows) -> d_us_txt.sqlite3. Soft-fail:
+# captcha hiccups on this one must not hard-fail the nightly run.
+tmp=$(mktemp)
+echo "--- stooq-current ---"
+if timeout 400 "${PY[@]}" fetch_stooq_current.py >"$tmp" 2>&1; then
+  tail -2 "$tmp"
 else
-  echo "!! $MERGED missing - skipping rebuild"; rc=1
+  echo "stooq-current skipped (captcha or download issue); rc=$?"
+  tail -2 "$tmp"
 fi
+rm -f "$tmp"
 
 echo "--- final state ---"
 ROOT="$ROOT" "${PY[@]}" - <<'EOF'

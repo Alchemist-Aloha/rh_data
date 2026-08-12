@@ -1,12 +1,8 @@
-"""Fetch the maximum daily history for every symbol from Robinhood into rh_data/.
+"""Fetch the maximum daily history for every symbol from Robinhood into SQLite.
 
-Writes files that mirror d_us_txt.zip's structure and row format:
-
-    rh_data/data/daily/us/<group>/<symbol>.us.txt
-
-Rate-limited to <=100 HTTP requests/minute by default (--rate to override).
-Symbols that already have a non-empty file are skipped (--refresh to refetch),
-so the script is resumable after an interrupted run.
+Writes rows directly into data/us.sqlite3 (bars table, upsert). No txt files.
+Symbols already present in the DB are skipped (--refresh to refetch), so the
+script is resumable after an interrupted run.
 
 Usage:
     python fetch_history.py                    # full universe from d_us_txt.zip
@@ -14,9 +10,8 @@ Usage:
     python fetch_history.py --symbols AAPL,MSFT
     python fetch_history.py --groups "nasdaq etfs,nysemkt stocks"
     python fetch_history.py --zip-path <archive.zip>   # custom source archive
-    python fetch_history.py --refresh          # overwrite existing files
+    python fetch_history.py --refresh          # refetch existing symbols
     python fetch_history.py --dry-run          # plan only, no network
-    python fetch_history.py --zip-out d_us_txt_merged.zip
 """
 
 from __future__ import annotations
@@ -35,13 +30,12 @@ def main() -> int:
     ap.add_argument("--limit", type=int, default=0, help="stop after N symbols (0 = no limit)")
     ap.add_argument("--rate", type=int, default=rc.DEFAULT_RATE, help="max HTTP requests per minute")
     ap.add_argument("--batch", type=int, default=rc.DEFAULT_BATCH, help="symbols per HTTP request")
-    ap.add_argument("--refresh", action="store_true", help="refetch even if the file already exists")
+    ap.add_argument("--refresh", action="store_true", help="refetch even if already in the DB")
     ap.add_argument("--dry-run", action="store_true", help="print the plan without fetching")
     ap.add_argument("--zip-path", default=rc.ZIP_PATH,
                     help="source archive for symbol discovery (default: project dir, else sibling)")
-    ap.add_argument("--zip-out", default="", help="also write a merged zip (overlays the source archive)")
     ap.add_argument("--db", default=rc.US_DB,
-                    help="SQLite db to also write (default: data/us.sqlite3; --db '' disables)")
+                    help="SQLite db to write (default: data/us.sqlite3; --db '' disables)")
     ap.add_argument("--log", default=os.path.join(rc.HERE, "fetch_history.log"))
     args = ap.parse_args()
 
@@ -70,27 +64,22 @@ def main() -> int:
         return 1
     symbols = sorted(groups)
 
-    # --- 2. Worklist: skip files that already exist ------------------------
-    todo: list[tuple[str, str, str]] = []
-    skipped = 0
-    for sym in symbols:
-        path = rc.out_path(sym, groups[sym])
-        if not args.refresh and os.path.exists(path) and rc.read_rows(path):
-            skipped += 1
-            continue
-        todo.append((sym, groups[sym], path))
+    # --- 2. Worklist: skip symbols already in the DB ------------------------
+    db_syms = rc.db_symbols(conn, "us") if conn is not None else set()
+    todo = [s for s in symbols if args.refresh or s not in db_syms]
+    skipped = len(symbols) - len(todo)
     if args.limit:
         todo = todo[: args.limit]
     rc.log(log_fh, f"universe={len(symbols)} already_fetched={skipped} to_fetch={len(todo)}")
 
     if not todo:
-        rc.log(log_fh, "nothing to fetch (use --refresh to overwrite existing files)")
+        rc.log(log_fh, "nothing to fetch (use --refresh to overwrite existing rows)")
         return 0
 
     if args.dry_run:
         rc.log(log_fh, "DRY RUN - would fetch:")
-        for sym, group, path in todo[:20]:
-            rc.log(log_fh, f"  {sym:10s} -> {os.path.relpath(path, rc.HERE)}")
+        for sym in todo[:20]:
+            rc.log(log_fh, f"  {sym:10s} -> data/us.sqlite3")
         if len(todo) > 20:
             rc.log(log_fh, f"  ... and {len(todo) - 20} more")
         rc.log(log_fh, f"DRY RUN done: {len(todo)} symbols at ~{args.rate}/min "
@@ -107,10 +96,9 @@ def main() -> int:
     n_batches = (len(todo) + args.batch - 1) // args.batch
     for i in range(0, len(todo), args.batch):
         chunk = todo[i : i + args.batch]
-        syms = [c[0] for c in chunk]
-        batch = rc.fetch_symbol_batch(stocks, syms, rc.SPAN_FULL, limiter, args.batch)
+        batch = rc.fetch_symbol_batch(stocks, chunk, rc.SPAN_FULL, limiter, args.batch)
         b_ok = b_fail = 0
-        for sym, group, path in chunk:
+        for sym in chunk:
             bars = batch.get(sym)
             rows = rc.bars_to_rows(sym, bars) if bars else []
             if not rows:
@@ -118,7 +106,6 @@ def main() -> int:
                 reason = "no data returned" if sym not in batch else "0 usable rows"
                 rc.log(log_fh, f"    FAIL {sym}: {reason}")
                 continue
-            rc.write_rows(path, rows)
             if conn is not None:
                 rc.upsert_rows(conn, rows, "us")
             b_ok += 1
@@ -128,11 +115,6 @@ def main() -> int:
                        f"ok={b_ok} fail={b_fail}")
 
     rc.log(log_fh, f"=== done: ok={ok} failed={failed} (see failed symbols above) ===")
-
-    # --- 4. Optional merged zip --------------------------------------------
-    if args.zip_out:
-        n = rc.merge_into_zip(args.zip_path, args.zip_out)
-        rc.log(log_fh, f"zip written: {args.zip_out} ({n} rh_data members overlaid)")
 
     if conn is not None:
         conn.close()

@@ -52,6 +52,11 @@ def main() -> int:
         help="output SQLite db (default: <zip name>.sqlite3 next to the zip)",
     )
     ap.add_argument("--limit", type=int, default=0, help="only first N files (0 = all)")
+    ap.add_argument("--overlay", default="",
+                    help="sqlite db whose bars are upserted after the zip "
+                         "(e.g. rh_data/data/us.sqlite3 - Robinhood-fetched rows)")
+    ap.add_argument("--overlay-market", default="us",
+                    help="market filter for --overlay source rows (default: us)")
     args = ap.parse_args()
 
     t0 = time.time()
@@ -95,8 +100,24 @@ def main() -> int:
 
     conn.commit()
     conn.close()
-    el = time.time() - t0
-    print(f"done: {n_done} files, {total_rows:,} rows -> {args.db} in {el:.0f}s")
+
+    # Optional overlay: upsert bars from another db on top (target market='us').
+    if args.overlay and os.path.exists(args.overlay):
+        conn = sqlite3.connect(args.db)
+        conn.execute("ATTACH DATABASE ? AS ov", (args.overlay,))
+        cur = conn.execute(
+            """INSERT INTO bars (symbol, market, date, open, high, low, close, volume, openint)
+               SELECT symbol, 'us', date, open, high, low, close, volume, openint
+               FROM ov.bars WHERE market = ?
+               ON CONFLICT (symbol, market, date) DO UPDATE SET
+                 open = excluded.open, high = excluded.high, low = excluded.low,
+                 close = excluded.close, volume = excluded.volume, openint = excluded.openint""",
+            (args.overlay_market,),
+        )
+        print(f"overlay: {cur.rowcount} rows upserted from {args.overlay} "
+              f"(market={args.overlay_market})")
+        conn.commit()
+        conn.close()
 
     # quick sanity
     c = sqlite3.connect(args.db)

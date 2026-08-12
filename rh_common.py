@@ -50,7 +50,7 @@ DATA_ROOT = os.path.join(HERE, "data")                   # generated dataset
 
 HEADER = "<TICKER>,<PER>,<DATE>,<TIME>,<OPEN>,<HIGH>,<LOW>,<CLOSE>,<VOL>,<OPENINT>"
 
-DEFAULT_RATE = 100      # max HTTP requests per minute (user constraint)
+DEFAULT_RATE = 80      # max HTTP requests per minute (user constraint)
 DEFAULT_BATCH = 50     # symbols per historicals HTTP request
 INTERVAL = "day"
 SPAN_FULL = "5year"    # max daily history the API serves
@@ -234,19 +234,29 @@ def discover_adr_from_tree(root: str = ADR_ROOT) -> list[str]:
     )
 
 
-def read_adr_manifest(root: str = ADR_ROOT) -> list[str]:
-    """Read the saved ADR symbol manifest (_adr_symbols.txt), if present."""
-    path = os.path.join(root, "_adr_symbols.txt")
-    if not os.path.exists(path):
+def read_adr_manifest(db: str | None = None) -> list[str]:
+    """Read the saved ADR symbol manifest from the adr sqlite (symbols table)."""
+    db = db or ADR_DB
+    try:
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        out = [r[0] for r in conn.execute("SELECT name FROM symbols ORDER BY name")]
+        conn.close()
+        return out
+    except sqlite3.Error:
         return []
-    return sorted({line.strip().upper() for line in open(path, encoding="utf-8") if line.strip()})
 
 
-def write_adr_manifest(symbols: Iterable[str], root: str = ADR_ROOT) -> None:
-    """Save the ADR symbol list to _adr_symbols.txt (reference only)."""
-    os.makedirs(root, exist_ok=True)
-    with open(os.path.join(root, "_adr_symbols.txt"), "w", encoding="utf-8") as f:
-        f.write("\n".join(sorted(set(symbols))) + "\n")
+def write_adr_manifest(symbols: Iterable[str], db: str | None = None) -> None:
+    """Save the ADR symbol list into the adr sqlite (symbols table)."""
+    db = db or ADR_DB
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE IF NOT EXISTS symbols (name TEXT PRIMARY KEY)")
+    conn.executemany(
+        "INSERT OR REPLACE INTO symbols (name) VALUES (?)",
+        [(s,) for s in sorted(set(symbols))],
+    )
+    conn.commit()
+    conn.close()
 
 
 def fetch_all_adr_symbols(limiter: RateLimiter, max_pages: int = 0) -> list[str]:
@@ -309,19 +319,29 @@ def discover_robinhood_from_tree(root: str = ROBINHOOD_ROOT) -> list[str]:
     )
 
 
-def read_robinhood_manifest(root: str = ROBINHOOD_ROOT) -> list[str]:
-    """Read the saved robinhood symbol manifest (_robinhood_symbols.txt)."""
-    path = os.path.join(root, "_robinhood_symbols.txt")
-    if not os.path.exists(path):
+def read_robinhood_manifest(db: str | None = None) -> list[str]:
+    """Read the saved robinhood symbol manifest from the sqlite (symbols table)."""
+    db = db or ROBINHOOD_DB
+    try:
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        out = [r[0] for r in conn.execute("SELECT name FROM symbols ORDER BY name")]
+        conn.close()
+        return out
+    except sqlite3.Error:
         return []
-    return sorted({line.strip().upper() for line in open(path, encoding="utf-8") if line.strip()})
 
 
-def write_robinhood_manifest(symbols: Iterable[str], root: str = ROBINHOOD_ROOT) -> None:
-    """Save the robinhood symbol list to _robinhood_symbols.txt (reference only)."""
-    os.makedirs(root, exist_ok=True)
-    with open(os.path.join(root, "_robinhood_symbols.txt"), "w", encoding="utf-8") as f:
-        f.write("\n".join(sorted(set(symbols))) + "\n")
+def write_robinhood_manifest(symbols: Iterable[str], db: str | None = None) -> None:
+    """Save the robinhood symbol list into the sqlite (symbols table)."""
+    db = db or ROBINHOOD_DB
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE IF NOT EXISTS symbols (name TEXT PRIMARY KEY)")
+    conn.executemany(
+        "INSERT OR REPLACE INTO symbols (name) VALUES (?)",
+        [(s,) for s in sorted(set(symbols))],
+    )
+    conn.commit()
+    conn.close()
 
 
 def fetch_all_robinhood_symbols(limiter: RateLimiter, max_pages: int = 0) -> list[str]:
@@ -599,6 +619,23 @@ CREATE TABLE IF NOT EXISTS bars (
 def resolve_db_path(db_arg: str) -> str:
     """Resolve a --db argument to an absolute path (relative -> project dir)."""
     return db_arg if os.path.isabs(db_arg) else os.path.join(HERE, db_arg)
+
+
+def db_symbols(conn: sqlite3.Connection, market: str) -> set[str]:
+    """Distinct symbols already stored in the bars table for a market."""
+    return {
+        r[0] for r in conn.execute(
+            "SELECT DISTINCT symbol FROM bars WHERE market = ?", (market,)
+        )
+    }
+
+
+def db_last_date(conn: sqlite3.Connection, symbol: str, market: str) -> int | None:
+    """Max stored bar date for one symbol/market, or None."""
+    row = conn.execute(
+        "SELECT MAX(date) FROM bars WHERE symbol = ? AND market = ?", (symbol, market)
+    ).fetchone()
+    return row[0] if row and row[0] is not None else None
 
 
 def open_db(db_path: str = US_DB) -> sqlite3.Connection:
