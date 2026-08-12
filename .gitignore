@@ -1,4 +1,5 @@
 login.toml
 __pycache__/
+.venv/
 data/
 *.log

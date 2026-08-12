@@ -1,0 +1,12 @@
+[project]
+name = "rh-data"
+version = "0.1.0"
+description = "Robinhood -> Stooq-style daily dataset (fetch/update scripts + sqlite export)"
+requires-python = ">=3.11"
+dependencies = [
+    "robin-stocks==3.4.0",
+    "toml",
+]
+
+[tool.uv]
+package = false
