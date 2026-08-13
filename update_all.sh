@@ -1,11 +1,9 @@
 #!/usr/bin/env bash
 # Nightly rh_data update (SQLite only - no txt files):
-#   1. update_daily.py            -> data/us.sqlite3 (full history for new
-#      zip symbols, incremental span='month' for stored symbols)
-#   2. update_adr_daily.py        -> data/adr.sqlite3
-#   3. update_robinhood_daily.py  -> data/robinhood.sqlite3
-#   4. convert_zip_to_sqlite.py   -> rebuild d_us_txt.sqlite3 from the stooq
-#      zip, then overlay the fresh data/us.sqlite3 rows on top
+#   1. update_robinhood_daily.py  -> data/robinhood.sqlite3 (the only rh_data DB)
+#   2. convert_zip_to_sqlite.py   -> rebuild d_us_txt.sqlite3 from the stooq
+#      zip, then overlay the fresh robinhood mirror rows on top
+#   3. fetch_stooq_current.py     -> today's Stooq Current-Data rows
 # Idempotent (UPSERT PK symbol,market,date) - safe to rerun.
 #
 # Exit codes: 0 ok, 1 hard failure. Symbol-level FAILs (exit 2 from the
@@ -30,13 +28,9 @@ step() {  # <name> <cmd...>
   rm -f "$tmp"
 }
 
-step us        "${PY[@]}" update_daily.py
-step adr       "${PY[@]}" update_adr_daily.py
 step robinhood "${PY[@]}" update_robinhood_daily.py
 step rebuild   "${PY[@]}" convert_zip_to_sqlite.py --zip "$ROOT/d_us_txt.zip" \
-                 --db "$ROOT/d_us_txt.sqlite3" --overlay "$HERE/data/us.sqlite3"
-step overlay-rh "${PY[@]}" convert_zip_to_sqlite.py --zip "$ROOT/d_us_txt.zip" \
-                 --db "$ROOT/d_us_txt.sqlite3" --limit 1 \
+                 --db "$ROOT/d_us_txt.sqlite3" \
                  --overlay "$HERE/data/robinhood.sqlite3" --overlay-market robinhood
 
 # Stooq Current Data snapshot (today's rows) -> d_us_txt.sqlite3. Soft-fail:
@@ -54,8 +48,7 @@ rm -f "$tmp"
 echo "--- final state ---"
 ROOT="$ROOT" "${PY[@]}" - <<'EOF'
 import os, sqlite3
-for rel, m in [("rh_data/data/us.sqlite3", "us"), ("rh_data/data/adr.sqlite3", "adr"),
-               ("rh_data/data/robinhood.sqlite3", "robinhood"), ("d_us_txt.sqlite3", "us (zip)")]:
+for rel, m in [("rh_data/data/robinhood.sqlite3", "robinhood"), ("d_us_txt.sqlite3", "us (zip)")]:
     p = os.path.join(os.environ["ROOT"], rel)
     try:
         c = sqlite3.connect(f"file:{p}?mode=ro", uri=True)

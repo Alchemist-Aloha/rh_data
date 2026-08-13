@@ -29,6 +29,10 @@ def main() -> int:
     ap.add_argument("--rate", type=int, default=rc.DEFAULT_RATE, help="max HTTP requests per minute")
     ap.add_argument("--batch", type=int, default=rc.DEFAULT_BATCH, help="symbols per HTTP request")
     ap.add_argument("--dry-run", action="store_true", help="print the plan without fetching")
+    ap.add_argument("--cross-fill-only", action="store_true",
+                    help="only gap-fill us.sqlite3 from the robinhood mirror db (no API calls)")
+    ap.add_argument("--no-cross-fill", action="store_true",
+                    help="skip the automatic robinhood-mirror gap-fill after fetching")
     ap.add_argument("--zip-path", default=rc.ZIP_PATH,
                     help="source archive for symbol discovery (default: project dir, else sibling)")
     ap.add_argument("--db", default=rc.US_DB,
@@ -41,6 +45,17 @@ def main() -> int:
     ro = rc.open_db(rc.resolve_db_path(args.db)) if (args.db and args.dry_run) else conn
     log_fh = open(args.log, "a", encoding="utf-8")
     rc.log(log_fh, f"=== update_daily start (rate={args.rate}/min, batch={args.batch}) ===")
+
+    if args.cross_fill_only:
+        if conn is None:
+            rc.log(log_fh, "cross-fill-only needs --db (default is fine)")
+            return 1
+        syms, rows = rc.cross_fill_from_mirror(conn, rc.ROBINHOOD_DB)
+        rc.log(log_fh, f"cross-fill: {syms} symbols, {rows} rows copied from "
+                       f"{rc.ROBINHOOD_DB}")
+        conn.close()
+        log_fh.close()
+        return 0
 
     # --- 1. Universe: zip symbols + anything already in the DB --------------
     if not os.path.exists(args.zip_path):
@@ -140,6 +155,13 @@ def main() -> int:
                            f"{b_added} new bars, {b_fail} failed")
 
     rc.log(log_fh, f"=== done: bars_added={total_added} failed={failed} ===")
+
+    # --- 5. Gap-fill from the robinhood mirror (cheap, no API) --------------
+    if conn is not None and not args.no_cross_fill:
+        syms, rows = rc.cross_fill_from_mirror(conn, rc.ROBINHOOD_DB)
+        if rows:
+            rc.log(log_fh, f"cross-fill: {syms} symbols, {rows} rows copied from "
+                           f"{rc.ROBINHOOD_DB}")
 
     if conn is not None:
         conn.close()

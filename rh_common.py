@@ -50,8 +50,8 @@ DATA_ROOT = os.path.join(HERE, "data")                   # generated dataset
 
 HEADER = "<TICKER>,<PER>,<DATE>,<TIME>,<OPEN>,<HIGH>,<LOW>,<CLOSE>,<VOL>,<OPENINT>"
 
-DEFAULT_RATE = 80      # max HTTP requests per minute (user constraint)
-DEFAULT_BATCH = 50     # symbols per historicals HTTP request
+DEFAULT_RATE = 100      # max HTTP requests per minute (user constraint)
+DEFAULT_BATCH = 30     # symbols per historicals HTTP request
 INTERVAL = "day"
 SPAN_FULL = "5year"    # max daily history the API serves
 SPAN_UPDATE = "month"  # enough to cover ~1 missed month for the daily updater
@@ -214,91 +214,6 @@ def out_path(symbol: str, group: str, root: str = DATA_ROOT) -> str:
 
 
 # ---------------------------------------------------------------------------
-# ADR (American Depositary Receipts) support
-# ---------------------------------------------------------------------------
-
-ADR_ROOT = os.path.join(DATA_ROOT, "daily", "adr")       # data/daily/adr
-
-
-def adr_path(symbol: str, root: str = ADR_ROOT) -> str:
-    """Path of an ADR's file inside the adr group (mirrors the zip naming)."""
-    return os.path.join(root, f"{zip_style(symbol).lower()}.us.txt")
-
-
-def discover_adr_from_tree(root: str = ADR_ROOT) -> list[str]:
-    """Return ADR symbols already fetched into the adr tree."""
-    if not os.path.isdir(root):
-        return []
-    return sorted(
-        fn[: -len(".us.txt")].upper() for fn in os.listdir(root) if fn.endswith(".us.txt")
-    )
-
-
-def read_adr_manifest(db: str | None = None) -> list[str]:
-    """Read the saved ADR symbol manifest from the adr sqlite (symbols table)."""
-    db = db or ADR_DB
-    try:
-        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
-        out = [r[0] for r in conn.execute("SELECT name FROM symbols ORDER BY name")]
-        conn.close()
-        return out
-    except sqlite3.Error:
-        return []
-
-
-def write_adr_manifest(symbols: Iterable[str], db: str | None = None) -> None:
-    """Save the ADR symbol list into the adr sqlite (symbols table)."""
-    db = db or ADR_DB
-    conn = sqlite3.connect(db)
-    conn.execute("CREATE TABLE IF NOT EXISTS symbols (name TEXT PRIMARY KEY)")
-    conn.executemany(
-        "INSERT OR REPLACE INTO symbols (name) VALUES (?)",
-        [(s,) for s in sorted(set(symbols))],
-    )
-    conn.commit()
-    conn.close()
-
-
-def fetch_all_adr_symbols(limiter: RateLimiter, max_pages: int = 0) -> list[str]:
-    """Enumerate current ADR instruments from Robinhood (rate-limited).
-
-    Paginates https://api.robinhood.com/instruments/?type=adr&active=true
-    through the rate limiter so every page counts against the request budget.
-    Filters client-side on type == 'adr' as a safety net in case the server
-    ignores the filter. Logs page progress to stderr.
-    """
-    import robin_stocks.robinhood.helper as helper
-
-    url = "https://api.robinhood.com/instruments/"
-    params = {"type": "adr", "active": "true"}
-    symbols: list[str] = []
-    pages = 0
-    while url:
-        limiter.wait()
-        try:
-            res = helper.SESSION.get(url, params=params if pages == 0 else None, timeout=30)
-            res.raise_for_status()
-            data = res.json()
-        except Exception as exc:
-            print(f"    !! instruments fetch failed (page {pages + 1}): {exc}", file=sys.stderr)
-            break
-        pages += 1
-        page_adrs = [
-            item["symbol"]
-            for item in data.get("results", [])
-            if item.get("type") == "adr" and item.get("symbol")
-        ]
-        symbols.extend(page_adrs)
-        print(f"    instruments page {pages}: {len(page_adrs)} adrs "
-              f"(total {len(symbols)})", file=sys.stderr)
-        url = data.get("next")
-        if max_pages and pages >= max_pages:
-            print(f"    (stopping after {max_pages} pages)", file=sys.stderr)
-            break
-    return sorted(set(symbols))
-
-
-# ---------------------------------------------------------------------------
 # Full-Robinhood-universe support (all equity instruments, not just ADRs)
 # ---------------------------------------------------------------------------
 
@@ -336,6 +251,7 @@ def write_robinhood_manifest(symbols: Iterable[str], db: str | None = None) -> N
     db = db or ROBINHOOD_DB
     conn = sqlite3.connect(db)
     conn.execute("CREATE TABLE IF NOT EXISTS symbols (name TEXT PRIMARY KEY)")
+    conn.execute("DELETE FROM symbols")  # refresh, not append
     conn.executemany(
         "INSERT OR REPLACE INTO symbols (name) VALUES (?)",
         [(s,) for s in sorted(set(symbols))],
@@ -596,9 +512,8 @@ def merge_into_zip(src_zip: str, out_zip: str, root: str = DATA_ROOT) -> int:
 # One database per market (the default layout); each pair's scripts default
 # to its own DB. Passing --db <path> anywhere writes to a single combined DB.
 US_DB = os.path.join(DATA_ROOT, "us.sqlite3")
-ADR_DB = os.path.join(DATA_ROOT, "adr.sqlite3")
 ROBINHOOD_DB = os.path.join(DATA_ROOT, "robinhood.sqlite3")
-MARKET_DB = {"us": US_DB, "adr": ADR_DB, "robinhood": ROBINHOOD_DB}
+MARKET_DB = {"us": US_DB, "robinhood": ROBINHOOD_DB}
 
 _DB_SCHEMA = """
 CREATE TABLE IF NOT EXISTS bars (
@@ -636,6 +551,49 @@ def db_last_date(conn: sqlite3.Connection, symbol: str, market: str) -> int | No
         "SELECT MAX(date) FROM bars WHERE symbol = ? AND market = ?", (symbol, market)
     ).fetchone()
     return row[0] if row and row[0] is not None else None
+
+
+def cross_fill_from_mirror(
+    conn: sqlite3.Connection, src_db: str, src_market: str = "robinhood"
+) -> tuple[int, int]:
+    """Fill gaps in this DB (market='us') from a mirror DB.
+
+    For every symbol present in BOTH DBs, upsert mirror rows newer than this
+    DB's max date for that symbol (target market is always 'us'). No-op when
+    src_db is missing. Returns (symbols_filled, rows_copied).
+    """
+    if not os.path.exists(src_db):
+        return 0, 0
+    conn.execute("ATTACH DATABASE ? AS src", (src_db,))
+    syms = conn.execute(
+        """SELECT COUNT(*) FROM (
+             SELECT u.symbol
+             FROM (SELECT symbol, MAX(date) AS md FROM main.bars
+                   WHERE market = 'us' GROUP BY symbol) u
+             JOIN (SELECT symbol, MAX(date) AS md FROM src.bars
+                   WHERE market = ? GROUP BY symbol) m
+               ON u.symbol = m.symbol AND m.md > u.md)""",
+        (src_market,),
+    ).fetchone()[0]
+    cur = conn.execute(
+        """INSERT INTO bars (symbol, market, date, open, high, low, close, volume, openint)
+           SELECT m.symbol, 'us', m.date, m.open, m.high, m.low, m.close, m.volume, m.openint
+           FROM src.bars m
+           JOIN (SELECT symbol, MAX(date) AS md FROM src.bars
+                 WHERE market = ? GROUP BY symbol) sm
+             ON m.symbol = sm.symbol AND m.market = ?
+           JOIN (SELECT symbol, MAX(date) AS md FROM main.bars
+                 WHERE market = 'us' GROUP BY symbol) um
+             ON m.symbol = um.symbol
+           WHERE m.date > um.md
+           ON CONFLICT (symbol, market, date) DO UPDATE SET
+             open = excluded.open, high = excluded.high, low = excluded.low,
+             close = excluded.close, volume = excluded.volume, openint = excluded.openint""",
+        (src_market, src_market),
+    )
+    conn.commit()
+    conn.execute("DETACH DATABASE src")
+    return syms, cur.rowcount
 
 
 def open_db(db_path: str = US_DB) -> sqlite3.Connection:
