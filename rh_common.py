@@ -50,8 +50,8 @@ DATA_ROOT = os.path.join(HERE, "data")                   # generated dataset
 
 HEADER = "<TICKER>,<PER>,<DATE>,<TIME>,<OPEN>,<HIGH>,<LOW>,<CLOSE>,<VOL>,<OPENINT>"
 
-DEFAULT_RATE = 100      # max HTTP requests per minute (user constraint)
-DEFAULT_BATCH = 30     # symbols per historicals HTTP request
+DEFAULT_RATE = 200      # max HTTP requests per minute (user constraint)
+DEFAULT_BATCH = 50     # symbols per historicals HTTP request
 INTERVAL = "day"
 SPAN_FULL = "5year"    # max daily history the API serves
 SPAN_UPDATE = "month"  # enough to cover ~1 missed month for the daily updater
@@ -286,11 +286,14 @@ def fetch_all_robinhood_symbols(limiter: RateLimiter, max_pages: int = 0) -> lis
         pages += 1
         page_results = data.get("results", [])
         for item in page_results:
+            # Robinhood currently ignores the endpoint's active=true filter.
+            if item.get("state") != "active":
+                continue
             sym = item.get("symbol")
             if sym:
                 keys.append(zip_style(sym))
-        print(f"    instruments page {pages}: {len(page_results)} instruments "
-              f"(total {len(keys)})", file=sys.stderr)
+        print(f"    instruments page {pages}: {len(page_results)} returned "
+              f"(active total {len(keys)})", file=sys.stderr)
         url = data.get("next")
         if max_pages and pages >= max_pages:
             print(f"    (stopping after {max_pages} pages)", file=sys.stderr)
